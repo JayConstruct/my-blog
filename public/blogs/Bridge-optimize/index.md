@@ -20,5 +20,4 @@
 
 ![](/blogs/Bridge-optimize/Bridge-optimize-4.webp)
 
-
 ![](/blogs/Bridge-optimize/Bridge-optimize-3.webp)
