@@ -1,12 +1,14 @@
 'use client'
 
-import { useCallback, useEffect, useState, type DragEvent } from 'react'
-import { motion, AnimatePresence } from 'motion/react'
+import { useCallback, useEffect, useState, useRef, type DragEvent } from 'react'
+import { motion } from 'motion/react'
+import { ANIMATION_DELAY, INIT_DELAY } from '@/consts'
+import { DialogModal } from '@/components/dialog-modal' // 复用你项目已有的组件
 import { GilbertAlgo } from '@/lib/crypto/gilbert'
 import { BlockShuffleAlgo } from '@/lib/crypto/block-shuffle'
 import JSZip from 'jszip'
 import { toast } from 'sonner'
-import { Download, Lock, Unlock, Plus, Trash2, Settings2, RefreshCw, Image as ImageIcon } from 'lucide-react'
+import { Lock, Unlock, RefreshCw } from 'lucide-react' // 使用 Lucide 图标更精致，或者换回 Emoji 🔒
 
 // --- 类型定义 ---
 type AlgoType = 'gilbert' | 'block'
@@ -21,45 +23,34 @@ interface ImageItem {
 	id: string
 	file: File
 	preview: string
+	width: number
+	height: number
 	resultPreview?: string
 	resultBlob?: Blob
 	status: 'idle' | 'processing' | 'done' | 'error'
 }
 
+function formatBytes(bytes: number) {
+	if (bytes < 1024) return `${bytes.toFixed(0)} B`
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+	return `${(bytes / 1024 / 1024).toFixed(2)} MB`
+}
+
 export default function Page() {
-	// 全局状态
+	// 状态
 	const [images, setImages] = useState<ImageItem[]>([])
-	const [dragActive, setDragActive] = useState(false)
-	
-	// 算法配置
 	const [algo, setAlgo] = useState<AlgoType>('gilbert')
 	const [blockLevel, setBlockLevel] = useState(40)
 	const [blockKey, setBlockKey] = useState('')
 	const [isProcessing, setIsProcessing] = useState(false)
+	const [compareIndex, setCompareIndex] = useState<number | null>(null)
+	const [isDragging, setIsDragging] = useState(false)
+	
+	const dragCounterRef = useRef(0)
+	const hasImages = images.length > 0
+	const hasProcessed = images.some(item => item.status === 'done')
 
-	// 右键菜单状态
-	const [contextMenu, setContextMenu] = useState<{ x: number; y: number; targetId: string } | null>(null)
-
-	// 关闭右键菜单
-	useEffect(() => {
-		const handleClick = () => setContextMenu(null)
-		window.addEventListener('click', handleClick)
-		return () => window.removeEventListener('click', handleClick)
-	}, [])
-
-	// 处理文件上传
-	const handleFiles = useCallback((fileList: FileList | null) => {
-		if (!fileList?.length) return
-		const newImages: ImageItem[] = Array.from(fileList).map(file => ({
-			id: Math.random().toString(36).slice(2),
-			file,
-			preview: URL.createObjectURL(file),
-			status: 'idle'
-		}))
-		setImages(prev => [...prev, ...newImages])
-	}, [])
-
-	// 核心处理逻辑
+	// 核心处理逻辑 (Promise 封装)
 	const processImage = async (item: ImageItem, mode: 'encrypt' | 'decrypt', options: ProcessingOptions) => {
 		return new Promise<ImageItem>((resolve) => {
 			setTimeout(() => {
@@ -85,14 +76,18 @@ export default function Page() {
 							BlockShuffleAlgo.process(ctx, canvas.width, canvas.height, options.blockLevel, options.blockKey, mode)
 						}
 
-						// 导出结果
+						// 导出结果 (使用 JPEG 0.95 以减小体积，混淆图对压缩不敏感)
 						canvas.toBlob(blob => {
 							if (blob) {
+								const resultUrl = URL.createObjectURL(blob)
+								// 如果有旧的 resultPreview，释放它
+								if (item.resultPreview) URL.revokeObjectURL(item.resultPreview)
+								
 								resolve({
 									...item,
 									status: 'done',
 									resultBlob: blob,
-									resultPreview: URL.createObjectURL(blob)
+									resultPreview: resultUrl
 								})
 							} else {
 								resolve({ ...item, status: 'error' })
@@ -109,14 +104,15 @@ export default function Page() {
 		})
 	}
 
-	// 批量执行
-	const handleRun = async (mode: 'encrypt' | 'decrypt') => {
-		if (images.length === 0) return
+	// 批量处理
+	const handleRunAll = async (mode: 'encrypt' | 'decrypt') => {
+		if (!hasImages || isProcessing) return
 		setIsProcessing(true)
 
 		const options: ProcessingOptions = { algo, blockLevel, blockKey }
 		const queue = [...images]
 		
+		// 串行处理避免卡顿
 		const results = []
 		for (const item of queue) {
 			setImages(prev => prev.map(p => p.id === item.id ? { ...p, status: 'processing' } : p))
@@ -126,37 +122,92 @@ export default function Page() {
 		}
 
 		setIsProcessing(false)
-		toast.success(mode === 'encrypt' ? '加密完成' : '解密完成')
+		toast.success(mode === 'encrypt' ? '全部加密完成' : '全部解密完成')
 	}
 
-	// 单个操作：还原/重制/删除
-	const handleResetItem = (id: string) => {
-		setImages(prev => prev.map(item => {
-			if (item.id !== id) return item
-			if (item.resultPreview) URL.revokeObjectURL(item.resultPreview)
-			return { ...item, status: 'idle', resultPreview: undefined, resultBlob: undefined }
-		}))
+	// 单个处理
+	const handleRunSingle = async (index: number, mode: 'encrypt' | 'decrypt') => {
+		const item = images[index]
+		if (item.status === 'processing') return
+		
+		setImages(prev => prev.map((p, i) => i === index ? { ...p, status: 'processing' } : p))
+		const res = await processImage(item, mode, { algo, blockLevel, blockKey })
+		setImages(prev => prev.map((p, i) => i === index ? res : p))
 	}
 
-	const handleRemoveItem = (id: string) => {
+	// 文件选择
+	const handleFiles = useCallback(async (fileList: FileList | null) => {
+		if (!fileList?.length) return
+		const files = Array.from(fileList).filter(file => file.type.startsWith('image/'))
+		if (!files.length) return
+
+		const nextItems = await Promise.all(
+			files.map(async file => {
+				const preview = URL.createObjectURL(file)
+				const bitmap = await createImageBitmap(file)
+				return {
+					id: Math.random().toString(36).slice(2),
+					file,
+					preview,
+					width: bitmap.width,
+					height: bitmap.height,
+					status: 'idle'
+				} as ImageItem
+			})
+		)
+
+		setImages(prev => [...prev, ...nextItems])
+	}, [])
+
+	// 拖拽逻辑 (与 Image Toolbox 保持一致)
+	const handleDragEnter = useCallback((event: DragEvent<HTMLLabelElement>) => {
+		event.preventDefault(); event.stopPropagation()
+		dragCounterRef.current += 1
+		setIsDragging(true)
+	}, [])
+	const handleDragOver = useCallback((event: DragEvent<HTMLLabelElement>) => {
+		event.preventDefault(); event.stopPropagation()
+	}, [])
+	const handleDragLeave = useCallback((event: DragEvent<HTMLLabelElement>) => {
+		event.preventDefault(); event.stopPropagation()
+		dragCounterRef.current = Math.max(0, dragCounterRef.current - 1)
+		if (dragCounterRef.current === 0) setIsDragging(false)
+	}, [])
+	const handleDrop = useCallback((event: DragEvent<HTMLLabelElement>) => {
+		event.preventDefault(); event.stopPropagation()
+		setIsDragging(false); dragCounterRef.current = 0
+		handleFiles(event.dataTransfer?.files ?? null)
+	}, [handleFiles])
+
+	// 移除
+	const handleRemove = useCallback((index: number) => {
 		setImages(prev => {
-			const target = prev.find(p => p.id === id)
-			if (target?.preview) URL.revokeObjectURL(target.preview)
-			if (target?.resultPreview) URL.revokeObjectURL(target.resultPreview)
-			return prev.filter(p => p.id !== id)
+			const next = [...prev]
+			const removed = next.splice(index, 1)[0]
+			if (removed) {
+				URL.revokeObjectURL(removed.preview)
+				if (removed.resultPreview) URL.revokeObjectURL(removed.resultPreview)
+			}
+			return next
 		})
-	}
+	}, [])
 
-    const handleReprocessSingle = async (id: string, mode: 'encrypt' | 'decrypt') => {
-        const target = images.find(p => p.id === id)
-        if (!target) return
-        setImages(prev => prev.map(p => p.id === id ? { ...p, status: 'processing' } : p))
-        const res = await processImage(target, mode, { algo, blockLevel, blockKey })
-        setImages(prev => prev.map(p => p.id === id ? res : p))
-    }
+	// 下载单个
+	const handleDownload = useCallback((index: number) => {
+		const target = images[index]
+		if (!target?.resultPreview) return
+		const link = document.createElement('a')
+		const ext = algo === 'gilbert' ? 'pixel' : 'block'
+		const baseName = target.file.name.replace(/\.[^.]+$/, '')
+		link.href = target.resultPreview
+		link.download = `${baseName}_${ext}.jpg`
+		document.body.appendChild(link)
+		link.click()
+		link.remove()
+	}, [images, algo])
 
-	// 打包下载
-	const handleDownloadAll = async () => {
+	// 批量下载
+	const handleDownloadAll = useCallback(async () => {
 		const processed = images.filter(i => i.status === 'done' && i.resultBlob)
 		if (processed.length === 0) return
 
@@ -174,296 +225,209 @@ export default function Page() {
 		link.href = URL.createObjectURL(content)
 		link.download = `secure_box_${Date.now()}.zip`
 		link.click()
-	}
+		link.remove()
+	}, [images, algo])
 
-	// 拖拽事件
-	const onDrag = (e: DragEvent) => { e.preventDefault(); e.stopPropagation(); }
-	const onDragEnter = (e: DragEvent) => { onDrag(e); setDragActive(true); }
-	const onDragLeave = (e: DragEvent) => { onDrag(e); setDragActive(false); }
-	const onDrop = (e: DragEvent) => { onDrag(e); setDragActive(false); handleFiles(e.dataTransfer.files); }
-
-	const isSingleMode = images.length === 1
+	// 清理内存
+	useEffect(() => {
+		return () => {
+			images.forEach(item => {
+				URL.revokeObjectURL(item.preview)
+				if (item.resultPreview) URL.revokeObjectURL(item.resultPreview)
+			})
+		}
+	}, [])
 
 	return (
-		<div className='relative min-h-screen bg-[#F8F9FA] pb-20 pt-20' onDragEnter={onDragEnter} onDragOver={onDrag} onDragLeave={onDragLeave} onDrop={onDrop}>
-			
-			{/* --- 1. 吸顶标题栏 (Sticky Header) --- */}
-            {/* 核心改动：使用 sticky top-0 + z-index 确保浮在图片上方 */}
-			<div className='sticky top-0 z-40 border-b border-slate-200 bg-white/80 px-6 py-3 backdrop-blur-md transition-all'>
-				<div className='mx-auto flex max-w-7xl items-center justify-between gap-4'>
-					<div className='flex items-center gap-3'>
-                        {/* 标题 */}
-						<h1 className='text-lg font-bold tracking-tight text-slate-800'>Secure Box</h1>
-                        <span className='hidden h-4 w-px bg-slate-200 sm:block'></span>
-                        <p className='hidden text-xs font-medium text-slate-500 sm:block'>本地图片隐私保护工具</p>
-                        
-                        {/* 状态指示器 */}
-                        {images.length > 0 && (
-                            <span className='ml-2 rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-semibold text-slate-600'>
-                                {images.length} {images.length > 1 ? 'images' : 'image'}
-                            </span>
-                        )}
-					</div>
+		<div className='relative px-6 pt-32 pb-12 text-sm max-sm:pt-28'>
+			<div className='mx-auto flex max-w-3xl flex-col gap-6'>
+				
+				{/* --- 1. 标题区 --- */}
+				<motion.div
+					initial={{ opacity: 0, scale: 0.9 }}
+					animate={{ opacity: 1, scale: 1 }}
+					transition={{ delay: INIT_DELAY }}
+					className='space-y-2 text-center'>
+					<p className='text-secondary text-xs tracking-[0.2em] uppercase'>Secure Box</p>
+					<h1 className='text-2xl font-semibold'>图片本地加解密</h1>
+					<p className='text-secondary'>纯前端混淆算法 · 数据不上传服务器</p>
+				</motion.div>
 
-					{/* 核心操作按钮组 (位于标题右侧，永远可见) */}
-					<div className='flex items-center gap-2'>
-						<button 
-                            onClick={() => handleRun('encrypt')} 
-                            disabled={isProcessing || !images.length} 
-                            className='flex items-center gap-1.5 rounded-full bg-slate-900 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-slate-700 hover:shadow disabled:opacity-50 disabled:shadow-none'
-                        >
-                            {isProcessing ? <RefreshCw className="h-3.5 w-3.5 animate-spin"/> : <Lock className="h-3.5 w-3.5"/>}
-							加密
-						</button>
-						<button 
-                            onClick={() => handleRun('decrypt')} 
-                            disabled={isProcessing || !images.length} 
-                            className='flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-4 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50'
-                        >
-                            {isProcessing ? <RefreshCw className="h-3.5 w-3.5 animate-spin"/> : <Unlock className="h-3.5 w-3.5"/>}
-							解密
-						</button>
-                        
-                        {/* 只要有一张处理完成，就显示下载按钮 */}
-                        {images.some(i => i.status === 'done') && (
-                            <div className="ml-1 h-6 w-px bg-slate-200 mx-1"></div>
-                        )}
-                        {images.some(i => i.status === 'done') && (
-                            <button 
-                                onClick={handleDownloadAll} 
-                                className='flex items-center gap-1.5 rounded-full bg-blue-600 px-4 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-blue-700'
-                            >
-                                <Download className="h-3.5 w-3.5"/>
-                                <span className="hidden sm:inline">打包下载</span>
-                            </button>
-                        )}
+				{/* --- 2. 拖拽上传卡片 --- */}
+				<motion.label
+					initial={{ opacity: 0, scale: 0.9 }}
+					animate={{ opacity: 1, scale: 1 }}
+					transition={{ delay: INIT_DELAY + ANIMATION_DELAY }}
+					onDragEnter={handleDragEnter}
+					onDragOver={handleDragOver}
+					onDragLeave={handleDragLeave}
+					onDrop={handleDrop}
+					className={`group hover:border-brand/20 card relative flex cursor-pointer flex-col items-center justify-center gap-3 text-center transition-colors hover:bg-white/80 ${
+						isDragging ? 'border-brand bg-white' : ''
+					}`}>
+					<input type='file' accept='image/*' multiple className='hidden' onChange={e => handleFiles(e.target.files)} />
+					<div className='bg-brand/10 text-brand/60 group-hover:bg-brand/10 flex h-20 w-20 items-center justify-center rounded-full text-3xl transition'>
+						🔒
 					</div>
-				</div>
-			</div>
+					<div>
+						<p className='text-base font-medium'>点击或拖拽图片</p>
+						<p className='text-secondary text-xs'>支持任意图片格式，处理后导出为 JPG</p>
+					</div>
+				</motion.label>
 
-            {/* --- 2. 配置工具栏 (Settings Toolbar) --- */}
-			<div className='mx-auto mt-6 max-w-7xl px-6'>
-                <motion.div 
-                    initial={{ opacity: 0, y: 10 }} 
-                    animate={{ opacity: 1, y: 0 }}
-                    className='flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white p-2 shadow-sm'
-                >
-                    {/* 左侧：参数设置 */}
-					<div className='flex flex-wrap items-center gap-4 px-2'>
-                        {/* 算法切换 */}
-						<div className='flex items-center rounded-lg bg-slate-100 p-1'>
-							<button onClick={() => setAlgo('gilbert')} className={`rounded-md px-3 py-1.5 text-xs transition-all ${algo === 'gilbert' ? 'bg-white font-medium shadow-sm text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}>
-								像素混淆 (Gilbert)
-							</button>
-							<button onClick={() => setAlgo('block')} className={`rounded-md px-3 py-1.5 text-xs transition-all ${algo === 'block' ? 'bg-white font-medium shadow-sm text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}>
-								宫格拼图 (Block)
-							</button>
+				{/* --- 3. 图片列表 --- */}
+				{hasImages && (
+					<motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className='card relative'>
+						<div className='text-secondary flex items-center justify-between border-b border-slate-200 pb-3 text-xs tracking-[0.2em] uppercase'>
+							<span>已选择 {images.length} 张图片</span>
+							<span>{images.some(i => i.status === 'processing') ? '处理中...' : '就绪'}</span>
+						</div>
+						<ul className='divide-y divide-slate-200'>
+							{images.map((item, index) => {
+								const { file, preview, status, width, height } = item
+								const isDone = status === 'done'
+								return (
+									<li key={item.id} className='flex items-center gap-4 py-3'>
+										{/* 缩略图 */}
+										<div className='h-12 w-12 overflow-hidden rounded-xl border border-slate-200 bg-slate-50'>
+											<img src={isDone ? item.resultPreview : preview} alt={file.name} className='h-full w-full object-cover' />
+										</div>
+										
+										{/* 信息 */}
+										<div className='flex flex-1 flex-col truncate'>
+											<p className='font-medium truncate'>{file.name}</p>
+											<p className='text-secondary text-xs'>
+												{width} × {height} · {formatBytes(file.size)}
+												{isDone && <span className='text-emerald-500 ml-2'>✓ 已完成</span>}
+											</p>
+										</div>
+
+										{/* 操作按钮 */}
+										<div className='flex flex-wrap justify-end gap-2 text-xs'>
+											{isDone ? (
+												<>
+													<button onClick={() => setCompareIndex(index)} className='border-brand text-brand hover:bg-brand/10 rounded-full border px-3 py-1 font-semibold transition'>
+														对比
+													</button>
+													<button onClick={() => handleDownload(index)} className='border-brand text-brand hover:bg-brand/10 rounded-full border px-3 py-1 font-semibold transition'>
+														下载
+													</button>
+												</>
+											) : (
+												<>
+													<button onClick={() => handleRunSingle(index, 'encrypt')} disabled={status === 'processing'} className='rounded-full border border-slate-200 px-3 py-1 font-medium transition hover:bg-slate-50 disabled:opacity-50'>
+														{status === 'processing' ? '...' : '加密'}
+													</button>
+													<button onClick={() => handleRunSingle(index, 'decrypt')} disabled={status === 'processing'} className='rounded-full border border-slate-200 px-3 py-1 font-medium transition hover:bg-slate-50 disabled:opacity-50'>
+														解密
+													</button>
+												</>
+											)}
+											<button onClick={() => handleRemove(index)} className='rounded-full border border-red-200 px-3 py-1 font-medium text-rose-400 transition hover:bg-rose-50'>
+												移除
+											</button>
+										</div>
+									</li>
+								)
+							})}
+						</ul>
+					</motion.div>
+				)}
+
+				{/* --- 4. 底部设置与全局操作 (模仿 Image Toolbox 的 Quality 卡片) --- */}
+				<motion.div
+					initial={{ opacity: 0, scale: 0.9 }}
+					animate={{ opacity: 1, scale: 1 }}
+					transition={{ delay: INIT_DELAY + 2 * ANIMATION_DELAY }}
+					className='card relative'>
+					
+					<div className='flex flex-col gap-4 md:flex-row md:items-start md:justify-between'>
+						{/* 设置区域 */}
+						<div className='flex-1 space-y-4'>
+							<div>
+								<p className='text-secondary text-xs tracking-[0.2em] uppercase'>算法设置</p>
+								<div className='flex flex-wrap items-center gap-3 pt-2'>
+									{/* 算法切换 */}
+									<div className='flex items-center rounded-lg bg-slate-100 p-1'>
+										<button onClick={() => setAlgo('gilbert')} className={`rounded-md px-3 py-1 text-xs transition-all ${algo === 'gilbert' ? 'bg-white font-medium shadow-sm text-brand' : 'text-slate-500 hover:text-slate-700'}`}>
+											Gilbert 像素混淆
+										</button>
+										<button onClick={() => setAlgo('block')} className={`rounded-md px-3 py-1 text-xs transition-all ${algo === 'block' ? 'bg-white font-medium shadow-sm text-brand' : 'text-slate-500 hover:text-slate-700'}`}>
+											Block 宫格拼图
+										</button>
+									</div>
+								</div>
+								<p className='text-xs text-slate-500 mt-2'>
+									{algo === 'gilbert' ? '基于 Gilbert 空间填充曲线打乱像素，视觉效果类似噪声。' : '将图片切分为网格并打乱顺序，支持密钥保护。'}
+								</p>
+							</div>
+
+							{/* Block 模式下的额外参数 */}
+							{algo === 'block' && (
+								<div className='flex flex-wrap items-center gap-4 animate-in fade-in slide-in-from-top-2'>
+									<div className='flex items-center gap-2'>
+										<label className='text-secondary text-xs tracking-[0.2em] uppercase'>等级</label>
+										<input 
+											type='number' min={2} max={100} value={blockLevel} 
+											onChange={e => setBlockLevel(Number(e.target.value))}
+											className='w-16 rounded border border-slate-200 px-2 py-1 text-sm focus:border-brand'
+										/>
+									</div>
+									<div className='flex items-center gap-2'>
+										<label className='text-secondary text-xs tracking-[0.2em] uppercase'>密钥</label>
+										<input 
+											type='text' placeholder='默认' value={blockKey} 
+											onChange={e => setBlockKey(e.target.value)}
+											className='w-24 rounded border border-slate-200 px-2 py-1 text-sm focus:border-brand'
+										/>
+									</div>
+								</div>
+							)}
 						</div>
 
-                        <div className="h-6 w-px bg-slate-100"></div>
-
-						{/* 参数输入 - 仅在 block 模式显示 */}
-						{algo === 'block' ? (
-							<div className="flex items-center gap-3 animate-in fade-in slide-in-from-left-2 duration-300">
-								<div className='flex items-center gap-2' title="混淆密度 (等级越高块越小)">
-                                    <Settings2 className="h-3.5 w-3.5 text-slate-400"/>
-									<span className='text-xs font-medium text-slate-500'>等级:</span>
-									<input 
-                                        type="number" min={2} max={200} 
-                                        value={blockLevel} onChange={e => setBlockLevel(Number(e.target.value))} 
-                                        className='w-16 rounded border border-slate-200 px-2 py-1 text-center text-xs focus:border-blue-500 focus:outline-none' 
-                                    />
-								</div>
-                                <div className='flex items-center gap-2'>
-									<span className='text-xs font-medium text-slate-500'>密钥:</span>
-									<input 
-                                        type="text" placeholder="默认" 
-                                        value={blockKey} onChange={e => setBlockKey(e.target.value)} 
-                                        className='w-32 rounded border border-slate-200 px-2 py-1 text-xs focus:border-blue-500 focus:outline-none' 
-                                    />
-								</div>
-							</div>
-						) : (
-                            <span className="text-xs text-slate-400 flex items-center gap-1.5">
-                                <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                                无需参数，基于数学曲线混淆
-                            </span>
-                        )}
-					</div>
-					
-					{/* 右侧：文件操作 */}
-					<div className='flex items-center gap-2 px-2'>
-                        <label className='cursor-pointer flex items-center gap-1.5 rounded-lg border border-dashed border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-600 hover:border-blue-500 hover:text-blue-600 hover:bg-blue-50 transition-colors'>
-                            <Plus className="h-3.5 w-3.5"/>
-                            <span>添加图片</span>
-                            <input type='file' accept='image/*' multiple className='hidden' onChange={e => handleFiles(e.target.files)} />
-                        </label>
-                        {images.length > 0 && (
-                            <button onClick={() => setImages([])} className='flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium text-rose-500 hover:bg-rose-50 transition-colors'>
-                                <Trash2 className="h-3.5 w-3.5"/>
-                                清空
-                            </button>
-                        )}
+						{/* 全局操作按钮 */}
+						<div className='flex flex-wrap gap-2 text-sm self-end md:self-auto'>
+							<button
+								onClick={() => handleRunAll('encrypt')}
+								disabled={!hasImages || isProcessing}
+								className='rounded-full border border-slate-200 px-4 py-2 font-medium transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-300 flex items-center gap-2'>
+								<Lock className="w-4 h-4" /> 全部加密
+							</button>
+							<button
+								onClick={() => handleRunAll('decrypt')}
+								disabled={!hasImages || isProcessing}
+								className='rounded-full border border-slate-200 px-4 py-2 font-medium transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-300 flex items-center gap-2'>
+								<Unlock className="w-4 h-4" /> 全部解密
+							</button>
+							<button
+								onClick={handleDownloadAll}
+								disabled={!hasProcessed}
+								className='border-brand text-brand rounded-full border px-4 py-2 font-semibold transition hover:bg-brand/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:text-slate-300'>
+								全部下载
+							</button>
+						</div>
 					</div>
 				</motion.div>
 			</div>
 
-			{/* --- 3. 图片展示区 (Content) --- */}
-			<div className='mx-auto mt-6 max-w-7xl px-6'>
-				{!images.length ? (
-                    // 空状态
-					<motion.div 
-                        initial={{ opacity: 0, scale: 0.95 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        className={`flex h-80 flex-col items-center justify-center rounded-2xl border-2 border-dashed transition-all duration-300 ${dragActive ? 'border-blue-500 bg-blue-50 scale-[1.02]' : 'border-slate-200 bg-white/50'}`}
-                    >
-                        <div className="rounded-full bg-slate-100 p-4 mb-4">
-                            <ImageIcon className="h-8 w-8 text-slate-400"/>
-                        </div>
-						<p className='text-sm font-medium text-slate-600'>点击上方“添加图片”或直接拖拽文件到这里</p>
-                        <p className='text-xs text-slate-400 mt-2'>支持 JPG, PNG, WebP 等格式</p>
-					</motion.div>
-				) : isSingleMode ? (
-					// 单图模式 (左右对比)
-					<motion.div layout className='grid grid-cols-1 gap-6 lg:grid-cols-2'>
-                        {/* 左：原图 */}
-						<div className='card flex flex-col gap-3 p-4'>
-                            <div className="flex items-center justify-between">
-							    <span className='text-xs font-bold uppercase tracking-wider text-slate-400'>Original</span>
-                                <span className='text-xs text-slate-400'>{images[0].file.name}</span>
-                            </div>
-							<div className="relative h-[60vh] w-full rounded-lg bg-slate-100/50 border border-slate-100 flex items-center justify-center overflow-hidden">
-                                <img src={images[0].preview} className='max-h-full max-w-full object-contain' alt="Original" />
-                            </div>
+			{/* --- 5. 对比模态框 (完全复用 Image Toolbox) --- */}
+			{compareIndex !== null && images[compareIndex]?.resultPreview && (
+				<DialogModal open={true} onClose={() => setCompareIndex(null)} className='w-full'>
+					<div className='grid w-full grid-cols-2 gap-4' onClick={() => setCompareIndex(null)}>
+						<div className='flex flex-col items-end p-4'>
+							<div>
+								<div className='text-secondary text-center text-sm font-medium'>原图</div>
+								<img src={images[compareIndex].preview} alt='Original' className='mt-3 max-h-[80vh] rounded-xl bg-slate-100 object-contain' />
+							</div>
 						</div>
-
-                        {/* 右：结果图 */}
-						<div 
-                            className={`card flex flex-col gap-3 p-4 relative transition-colors ${images[0].status === 'done' ? 'ring-2 ring-blue-500/20' : ''}`}
-                            onContextMenu={(e) => {
-                                e.preventDefault()
-                                if(images[0].status === 'done') setContextMenu({ x: e.clientX, y: e.clientY, targetId: images[0].id })
-                            }}
-                        >
-                            <div className="flex items-center justify-between">
-							    <span className='text-xs font-bold uppercase tracking-wider text-slate-400'>Result Preview</span>
-                                {images[0].status === 'done' && <span className='text-[10px] bg-emerald-100 text-emerald-600 px-2 py-0.5 rounded-full font-medium'>已完成</span>}
-                            </div>
-							
-                            <div className="relative h-[60vh] w-full rounded-lg bg-slate-100/50 border border-slate-100 flex items-center justify-center overflow-hidden group cursor-context-menu">
-                                {images[0].status === 'done' ? (
-                                    <img src={images[0].resultPreview} className='max-h-full max-w-full object-contain' alt="Result" />
-                                ) : images[0].status === 'processing' ? (
-                                    <div className='flex flex-col items-center gap-3 text-slate-400'>
-                                        <RefreshCw className="h-8 w-8 animate-spin text-blue-500"/>
-                                        <span className="text-xs">Processing...</span>
-                                    </div>
-                                ) : (
-                                    <div className='flex flex-col items-center gap-2 text-slate-300'>
-                                        <Lock className="h-8 w-8"/>
-                                        <span className="text-xs">等待操作</span>
-                                    </div>
-                                )}
-                                
-                                {/* 右键提示遮罩 */}
-                                {images[0].status === 'done' && (
-                                    <div className="absolute inset-0 bg-black/0 group-hover:bg-black/5 transition-colors flex items-end justify-end p-4">
-                                        <span className="bg-white/90 backdrop-blur text-[10px] text-slate-500 px-2 py-1 rounded shadow-sm opacity-0 group-hover:opacity-100 transition-opacity">
-                                            右键更多选项
-                                        </span>
-                                    </div>
-                                )}
-                            </div>
+						<div className='flex flex-col items-start p-4'>
+							<div>
+								<div className='text-secondary text-center text-sm font-medium'>结果 ({formatBytes(images[compareIndex].resultBlob?.size || 0)})</div>
+								<img src={images[compareIndex].resultPreview} alt='Result' className='mt-3 max-h-[80vh] rounded-xl bg-slate-100 object-contain' />
+							</div>
 						</div>
-					</motion.div>
-				) : (
-					// 多图模式 (网格列表)
-					<motion.div layout className='grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3'>
-						<AnimatePresence>
-							{images.map(item => (
-								<motion.div
-									key={item.id}
-									layout
-									initial={{ opacity: 0, scale: 0.9 }}
-									animate={{ opacity: 1, scale: 1 }}
-									exit={{ opacity: 0, scale: 0.9 }}
-									className='card group relative overflow-hidden p-3 hover:shadow-md transition-shadow'
-                                    onContextMenu={(e) => {
-                                        e.preventDefault()
-                                        if(item.status === 'done') setContextMenu({ x: e.clientX, y: e.clientY, targetId: item.id })
-                                    }}
-								>
-									<div className='flex gap-2 h-48'>
-                                        {/* 原图 */}
-										<div className='relative flex-1 bg-slate-50 rounded-lg overflow-hidden border border-slate-100'>
-                                            <img src={item.preview} className='h-full w-full object-cover' />
-                                            <div className="absolute top-2 left-2 text-[10px] font-medium bg-black/60 backdrop-blur text-white px-1.5 py-0.5 rounded">Original</div>
-                                        </div>
-                                        {/* 结果图 */}
-										<div className='relative flex-1 bg-slate-100 rounded-lg overflow-hidden border border-slate-100 flex items-center justify-center'>
-											{item.status === 'done' ? (
-												<img src={item.resultPreview} className='h-full w-full object-cover' />
-											) : item.status === 'processing' ? (
-												<RefreshCw className='animate-spin h-6 w-6 text-slate-400'/>
-											) : (
-												<span className='text-xs text-slate-300'>Wait</span>
-											)}
-                                            {item.status === 'done' && <div className="absolute top-2 right-2 text-[10px] font-medium bg-blue-600 text-white px-1.5 py-0.5 rounded shadow-sm">Result</div>}
-										</div>
-									</div>
-                                    <div className="mt-3 flex items-center justify-between border-t border-slate-50 pt-2">
-                                        <p className="text-xs font-medium text-slate-600 truncate max-w-[150px]" title={item.file.name}>{item.file.name}</p>
-                                        <button onClick={() => handleRemoveItem(item.id)} className="p-1 text-slate-300 hover:text-rose-500 transition-colors">
-                                            <Trash2 className="h-3.5 w-3.5"/>
-                                        </button>
-                                    </div>
-								</motion.div>
-							))}
-						</AnimatePresence>
-					</motion.div>
-				)}
-			</div>
-
-			{/* --- 自定义右键菜单 --- */}
-			{contextMenu && (
-				<div
-					className='fixed z-50 min-w-[140px] overflow-hidden rounded-xl border border-slate-100 bg-white/90 shadow-xl backdrop-blur-md animate-in fade-in zoom-in-95 duration-100'
-					style={{ left: contextMenu.x, top: contextMenu.y }}
-					onClick={(e) => e.stopPropagation()}
-				>
-					<div className='flex flex-col py-1'>
-                        <div className="px-3 py-1.5 text-[10px] font-bold uppercase text-slate-400 tracking-wider">Actions</div>
-						<button 
-                            onClick={() => { handleReprocessSingle(contextMenu.targetId, 'encrypt'); setContextMenu(null) }}
-                            className='flex items-center gap-2 px-3 py-2 text-left text-xs text-slate-700 hover:bg-blue-50 hover:text-blue-600 transition-colors'
-                        >
-                            <Lock className="h-3 w-3"/>
-							重做 (加密)
-						</button>
-                        <button 
-                            onClick={() => { handleReprocessSingle(contextMenu.targetId, 'decrypt'); setContextMenu(null) }}
-                            className='flex items-center gap-2 px-3 py-2 text-left text-xs text-slate-700 hover:bg-emerald-50 hover:text-emerald-600 transition-colors'
-                        >
-                            <Unlock className="h-3 w-3"/>
-							重做 (解密)
-						</button>
-                        <div className="my-1 h-px bg-slate-100"></div>
-						<button 
-                            onClick={() => { handleResetItem(contextMenu.targetId); setContextMenu(null) }}
-                            className='flex items-center gap-2 px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-50 transition-colors'
-                        >
-                            <RefreshCw className="h-3 w-3"/>
-							还原状态
-						</button>
-						<button 
-                            onClick={() => { handleRemoveItem(contextMenu.targetId); setContextMenu(null) }}
-                            className='flex items-center gap-2 px-3 py-2 text-left text-xs text-rose-500 hover:bg-rose-50 transition-colors'
-                        >
-                            <Trash2 className="h-3 w-3"/>
-							删除图片
-						</button>
 					</div>
-				</div>
+				</DialogModal>
 			)}
 		</div>
 	)
