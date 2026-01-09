@@ -18,6 +18,6 @@
 
 优化后的效果(材料为大简petg HF 无盘 白色)
 
-![](/blogs/Bridge-optimize/Bridge-optimize-4.webp)
+![](/blogs/Bridge-optimize/9136fb9cc77407cc.webp)
 
-![](/blogs/Bridge-optimize/Bridge-optimize-3.webp)
+![](/blogs/Bridge-optimize/f25a91723fa1d8f7.webp)
