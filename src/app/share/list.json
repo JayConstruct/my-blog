@@ -8,5 +8,15 @@
 			"图片"
 		],
 		"stars": 3
+	},
+	{
+		"name": "图片加密",
+		"logo": "blob:https://blog.2642888.xyz/12842ca4-e4f8-4dd3-9a78-411a85647631",
+		"url": "https://blog.2642888.xyz/image-crypto",
+		"description": "本地图片安全加密",
+		"tags": [
+			"图片"
+		],
+		"stars": 3
 	}
 ]
